@@ -7,6 +7,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Arrange files
+        run: |
+          mkdir -p www assets
+          [ -f index.html ] && mv index.html www/index.html || true
+          mv icon-*.png assets/ || true
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - uses: actions/setup-java@v4
