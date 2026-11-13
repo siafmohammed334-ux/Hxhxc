@@ -44,6 +44,7 @@ details summary{font-weight:700;cursor:pointer}details p{color:#374151;line-heig
 <div id="ld"></div>
 <script>
 const $=s=>document.querySelector(s);
+const MODEL='gemini-2.5-flash';
 let db=JSON.parse(localStorage.ms||'{"items":[],"sched":[]}');
 const save=()=>localStorage.ms=JSON.stringify(db);
 const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -52,14 +53,12 @@ const fmt=s=>String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(
 const b64=b=>new Promise(r=>{const f=new FileReader();f.onload=()=>r(f.result.split(',')[1]);f.readAsDataURL(b)});
 const busy=m=>{const l=$('#ld');l.style.display=m?'flex':'none';l.textContent=m||''};
 let tab='lec',cur=null,sub='a',zs={},mr,stream,chunks=[],secs=0,ti,paused=false,rs=false;
-// تخزين الـ PDF
 const idb=()=>new Promise(r=>{const q=indexedDB.open('ms',1);q.onupgradeneeded=()=>q.result.createObjectStore('f');q.onsuccess=()=>r(q.result)});
 const fput=async(k,v)=>{const d=await idb();return new Promise(r=>{const t=d.transaction('f','readwrite');t.objectStore('f').put(v,k);t.oncomplete=r})};
 const fget=async k=>{const d=await idb();return new Promise(r=>{const q=d.transaction('f').objectStore('f').get(k);q.onsuccess=()=>r(q.result)})};
-// Gemini
 async function gem(parts,json){
- const key=localStorage.k;if(!key)throw new Error('ضيف مفتاح Gemini من الإعدادات الأول');
- const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key='+key,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});
+ const key=localStorage.k||'__GEMINI_KEY__';if(key.startsWith('__'))throw new Error('المفتاح مش متضاف');
+ const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+MODEL+':generateContent?key='+key,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});
  const d=await r.json();if(d.error)throw new Error(d.error.message);
  return d.candidates[0].content.parts.map(p=>p.text||'').join('');
 }
@@ -70,100 +69,4 @@ function render(){
  if(cur){$('#m').innerHTML=detail();if(sub=='a'&&cur.type=='pdf')showPdf();return}
  $('#m').innerHTML={lec:lecV,pdf:pdfV,sch:schV,set:setV}[tab]();
 }
-const itemCard=i=>`<div class="card" onclick="open_('${i.id}')"><b>${esc(i.title)}</b><small>${i.date}</small></div>`;
-function lecV(){
- const l=db.items.filter(i=>i.type=='lec');
- const ctl=!rs?`<button class="big" onclick="startRec()">🎙️ ابدأ التسجيل</button>`:`<div class="tm" id="tm">${fmt(secs)}</div><div class="row"><button class="btn" onclick="pauseRec()">${paused?'▶️ استكمال':'⏸️ إيقاف مؤقت'}</button><button class="btn red" onclick="stopRec()">⏹️ إيقاف نهائي</button></div>`;
- return `<h2>المحاضرات</h2><div class="card c">${ctl}</div>`+(l.length?l.map(itemCard).join(''):'<p class="mt">لسه مفيش محاضرات</p>');
-}
-async function startRec(){
- try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}catch(e){return alert('محتاج صلاحية الميكروفون')}
- chunks=[];mr=new MediaRecorder(stream,{audioBitsPerSecond:32000});
- mr.ondataavailable=e=>e.data.size&&chunks.push(e.data);mr.start(1000);
- rs=true;paused=false;secs=0;
- ti=setInterval(()=>{if(!paused){secs++;const t=$('#tm');if(t)t.textContent=fmt(secs)}},1000);render();
-}
-function pauseRec(){paused?mr.resume():mr.pause();paused=!paused;render()}
-function stopRec(){
- clearInterval(ti);
- mr.onstop=async()=>{stream.getTracks().forEach(t=>t.stop());rs=false;const blob=new Blob(chunks,{type:mr.mimeType||'audio/webm'});render();await proc(blob)};
- mr.stop();
-}
-async function proc(blob){
- busy('جاري تحويل الصوت لنص...');
- try{
-  const data=await b64(blob);
-  const text=await gem([{inline_data:{mime_type:blob.type.split(';')[0],data}},{text:'فرّغ هذا التسجيل كاملاً إلى نص مكتوب بنفس لغة المتحدث، مقسم لفقرات وبعلامات ترقيم. اكتب النص فقط بدون تعليق.'}]);
-  const it={id:'i'+Date.now(),type:'lec',title:'محاضرة '+new Date().toLocaleDateString('ar-EG'),date:new Date().toLocaleString('ar-EG'),text};
-  db.items.unshift(it);save();cur=it;sub='a';zs={};busy(0);render();gen('s');
- }catch(e){busy(0);alert(e.message)}
-}
-function pdfV(){
- const l=db.items.filter(i=>i.type=='pdf');
- return `<h2>ملفات PDF</h2><label class="big up">📎 إضافة ملف PDF<input type="file" accept="application/pdf" hidden onchange="addPdf(event)"></label>`+(l.length?l.map(itemCard).join(''):'<p class="mt">لسه مفيش ملفات</p>');
-}
-async function addPdf(e){
- const f=e.target.files[0];if(!f)return;busy('جاري الحفظ...');
- const id='i'+Date.now();await fput(id,await b64(f));
- db.items.unshift({id,type:'pdf',title:f.name.replace(/\.pdf$/i,''),date:new Date().toLocaleString('ar-EG')});save();busy(0);render();
-}
-function open_(id){cur=db.items.find(i=>i.id==id);sub='a';zs={};render()}
-function back(){cur=null;render()}
-function del(){if(confirm('تحذف العنصر ده؟')){db.items=db.items.filter(i=>i!=cur);save();cur=null;render()}}
-function detail(){
- const it=cur,L=it.type=='lec';
- const tabs=[['a',L?'📖 القراءة':'📄 فتح'],['s','📝 ملخص'],['q','❓ أسئلة وأجوبة'],['z','✅ اختبار']];
- let body='';
- if(sub=='a')body=L?`<div class="read">${esc(it.text).replace(/\n/g,'<br>')}</div>`:'<div id="pv"><p class="mt">جاري التحميل...</p></div>';
- else{
-  const has=it[sub],label={s:'لخّص',q:'اعمل أسئلة وأجوبة',z:'اعمل اختبار'}[sub];
-  const foc=L?'':`<input id="fc" placeholder="ركّز على (اختياري): مثلاً الدرس الأول">`;
-  body=foc+`<div class="c"><button class="btn" onclick="gen('${sub}')">${has?'🔄 إعادة الإنشاء':'✨ '+label}</button></div>`+(has?{s:()=>`<div class="read">${md(it.s)}</div>`,q:qaH,z:quizH}[sub]():'');
- }
- return `<div class="top"><button class="ic" onclick="back()">→</button><b>${esc(it.title)}</b><button class="ic" onclick="del()">🗑️</button></div><div class="seg">${tabs.map(t=>`<button class="${sub==t[0]?'on':''}" onclick="sub='${t[0]}';render()">${t[1]}</button>`).join('')}</div>`+body;
-}
-const qaH=()=>cur.q.map(x=>`<details class="card"><summary>${esc(x.q)}</summary><p>${esc(x.a)}</p></details>`).join('');
-function quizH(){
- const z=cur.z;let sc=0,n=0;
- const h=z.map((x,i)=>{const p=zs[i];if(p!=null){n++;if(p==x.answer)sc++}
-  return `<div class="card"><b>${i+1}. ${esc(x.q)}</b>${x.options.map((o,j)=>`<button class="opt ${p!=null?(j==x.answer?'ok':j==p?'no':''):''}" onclick="pick(${i},${j})">${esc(o)}</button>`).join('')}</div>`}).join('');
- return h+(n==z.length?`<div class="card c"><h3>النتيجة: ${sc} / ${z.length}</h3></div>`:'');
-}
-function pick(i,j){if(zs[i]!=null)return;zs[i]=j;render()}
-async function gen(kind){
- const it=cur,focus=($('#fc')||{}).value||'';busy('جاري الإنشاء...');
- try{
-  const src=it.type=='lec'?[{text:'المحاضرة:\n'+it.text}]:[{inline_data:{mime_type:'application/pdf',data:await fget(it.id)}}];
-  const P={s:'لخّص المحتوى في ملخص منظم بعناوين ونقاط واضحة، بنفس لغة المحتوى.',
-   q:'اعمل 10 أسئلة وأجوبة قصيرة للمراجعة بنفس لغة المحتوى. رجّع JSON فقط بالشكل: [{"q":"","a":""}]',
-   z:'اعمل اختبار من 8 أسئلة اختيار من متعدد (4 اختيارات لكل سؤال) بنفس لغة المحتوى. رجّع JSON فقط بالشكل: [{"q":"","options":["","","",""],"answer":0}] حيث answer رقم الاختيار الصحيح من 0 إلى 3.'}[kind]+(focus?' ركّز فقط على: '+focus:'');
-  const t=await gem([...src,{text:P}],kind!='s');
-  it[kind]=kind=='s'?t:JSON.parse(t);if(kind=='z')zs={};save();
- }catch(e){alert(e.message)}
- busy(0);if(cur==it)render();
-}
-async function pdfjs(){
- if(window.pdfjsLib)return;
- await new Promise(r=>{const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js';s.onload=r;s.onerror=r;document.head.appendChild(s)});
- pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
-}
-async function showPdf(){
- const it=cur,box=$('#pv');
- try{
-  await pdfjs();const raw=atob(await fget(it.id));const u=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)u[i]=raw.charCodeAt(i);
-  const pdf=await pdfjsLib.getDocument({data:u}).promise;box.innerHTML='';
-  for(let p=1;p<=pdf.numPages;p++){if(cur!=it||sub!='a')return;const pg=await pdf.getPage(p),vp=pg.getViewport({scale:1.5}),c=document.createElement('canvas');c.width=vp.width;c.height=vp.height;box.appendChild(c);await pg.render({canvasContext:c.getContext('2d'),viewport:vp}).promise}
- }catch(e){box.innerHTML='<p class="mt">تعذّر عرض الملف (محتاج إنترنت لأول مرة)</p>'}
-}
-const D=['السبت','الأحد','الإثنين','الثلاثاء','الأربعاء','الخميس','الجمعة'];
-function schV(){
- return `<h2>جدول المحاضرات</h2><div class="card"><select id="sd">${D.map(d=>`<option>${d}</option>`).join('')}</select><input id="st" type="time"><input id="ss" placeholder="المادة"><input id="sp" placeholder="المكان / القاعة"><button class="btn" onclick="addS()">➕ إضافة</button></div>`+
- D.map(d=>{const r=db.sched.filter(x=>x.d==d).sort((a,b)=>a.t>b.t?1:-1);return r.length?`<div class="card"><b>${d}</b><table>${r.map(x=>`<tr><td>${x.t}</td><td>${esc(x.s)}</td><td>${esc(x.p)}</td><td><button class="ic" onclick="delS('${x.id}')">✖</button></td></tr>`).join('')}</table></div>`:''}).join('');
-}
-function addS(){if(!$('#ss').value)return;db.sched.push({id:'s'+Date.now(),d:$('#sd').value,t:$('#st').value||'--:--',s:$('#ss').value,p:$('#sp').value});save();render()}
-function delS(id){db.sched=db.sched.filter(x=>x.id!=id);save();render()}
-function setV(){
- return `<h2>الإعدادات</h2><div class="card"><b>مفتاح Gemini API</b><small>مجاني من aistudio.google.com/app/apikey — بيتحفظ على جهازك بس</small><input id="ak" type="password" value="${esc(localStorage.k||'')}" placeholder="AIza..."><button class="btn" onclick="localStorage.k=$('#ak').value.trim();alert('تم الحفظ ✅')">حفظ</button></div>`;
-}
-render();
-</script></body></html>
+const itemCard
