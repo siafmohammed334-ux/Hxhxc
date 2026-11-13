@@ -1,0 +1,29 @@
+name: Build Release APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - run: npm install
+      - run: npx cap add android
+      - name: Permissions + icons
+        run: |
+          sed -i 's#<application#<uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n    <application#' android/app/src/main/AndroidManifest.xml
+          npx capacitor-assets generate --android
+      - run: npx cap sync android
+      - run: cd android && chmod +x gradlew && ./gradlew assembleRelease
+      - name: Sign APK
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          keytool -genkeypair -keystore k.jks -alias key -keyalg RSA -keysize 2048 -validity 10000 -storepass 123456 -keypass 123456 -dname "CN=Mulakhasati"
+          $BT/zipalign -p 4 android/app/build/outputs/apk/release/app-release-unsigned.apk aligned.apk
+          $BT/apksigner sign --ks k.jks --ks-pass pass:123456 --key-pass pass:123456 --out mulakhasati.apk aligned.apk
+      - uses: actions/upload-artifact@v4
+        with: { name: mulakhasati-apk, path: mulakhasati.apk }
