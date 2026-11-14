@@ -10,6 +10,7 @@ main{padding:14px;max-width:700px;margin:auto}
 h2{margin:6px 0 12px}
 .card{background:var(--c);border-radius:16px;padding:14px;margin:10px 0;box-shadow:0 2px 8px #4f46e514}
 .card small{display:block;color:#6b7280;margin-top:4px}
+.warn{border:2px solid #f59e0b}
 .c{text-align:center}.mt{color:#6b7280;text-align:center}
 button{font-family:inherit;cursor:pointer}
 .big{display:block;width:100%;border:0;border-radius:14px;padding:16px;font-size:18px;font-weight:700;color:#fff;background:linear-gradient(135deg,var(--p),var(--t));text-align:center}
@@ -46,25 +47,137 @@ details summary{font-weight:700;cursor:pointer}details p{color:#374151;line-heig
 window.onerror=(m)=>{const x=document.querySelector('#m');if(x)x.innerHTML='<div class="card">حصل خطأ: '+m+'</div>'};
 const $=s=>document.querySelector(s);
 const MODEL='gemini-3.8-flash';
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 let db;try{db=JSON.parse(localStorage.ms||'null')}catch(e){}
 db=db||{items:[],sched:[]};db.items=db.items||[];db.sched=db.sched||[];
 const save=()=>{try{localStorage.ms=JSON.stringify(db)}catch(e){alert('المساحة مليانة')}};
+/* ===== تخزين الصوت (IndexedDB) عشان المحاضرة ماتضيعش ===== */
+const idb=new Promise((res,rej)=>{const r=indexedDB.open('ms',1);r.onupgradeneeded=()=>r.result.createObjectStore('a');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
+const aput=async(k,v)=>{const d=await idb;return new Promise((res,rej)=>{const t=d.transaction('a','readwrite');t.objectStore('a').put(v,k);t.oncomplete=res;t.onerror=()=>rej(t.error)})};
+const aget=async k=>{const d=await idb;return new Promise((res,rej)=>{const q=d.transaction('a').objectStore('a').get(k);q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error)})};
+const adel=async k=>{try{const d=await idb;return new Promise(res=>{const t=d.transaction('a','readwrite');t.objectStore('a').delete(k);t.oncomplete=res;t.onerror=res})}catch(e){}};
 const esc=s=>String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const md=s=>esc(s).replace(/^#+\s*(.*)$/gm,'<h4>$1</h4>').replace(/\*\*(.+?)\*\*/g,'<b>$1</b>').replace(/^[\*\-]\s+(.*)$/gm,'• $1').replace(/\n/g,'<br>');
 const fmt=s=>String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
 const b64=b=>new Promise(r=>{const f=new FileReader();f.onload=()=>r(f.result.split(',')[1]);f.readAsDataURL(b)});
+const u8b64=u=>{let s='';for(let i=0;i<u.length;i+=0x8000)s+=String.fromCharCode.apply(null,u.subarray(i,i+0x8000));return btoa(s)};
 const busy=m=>{const l=$('#ld');l.style.display=m?'flex':'none';l.textContent=m||''};
+const safeJ=t=>{try{return JSON.parse(t)}catch(e){return{title:'',summary:t}}};
 const D=['الأحد','الاثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت'];
-let tab='lec',cur=null,sub='a',zs={},mr,stream,chunks=[],secs=0,ti,paused=false;
-const P_LEC='ده تسجيل محاضرة. اكتب النص الكامل للكلام (transcript) ثم لخصه تلخيص منظم بعناوين ونقاط. رجّع JSON فقط بالشكل: {"title":"عنوان قصير","transcript":"...","summary":"..."}';
+let tab='lec',cur=null,sub='a',zs={},mr,stream,chunks=[],secs=0,ti,paused=false,wl=null;
+const P_S='ده تسجيل محاضرة. لخصه تلخيص منظم ومفصل بعناوين ونقاط. رجّع JSON فقط بالشكل: {"title":"عنوان قصير","summary":"..."}';
+const P_T='اكتب النص الكامل للكلام في التسجيل ده (transcript) كلمة بكلمة من غير أي مقدمة أو تعليق.';
 const P_PDF='لخّص ملف الـ PDF ده تلخيص منظم بعناوين ونقاط. رجّع JSON فقط بالشكل: {"title":"عنوان قصير","summary":"..."}';
 const P_Q='اعمل 8 أسئلة اختيار من متعدد (4 اختيارات) من المحتوى التالي. رجّع JSON فقط: [{"q":"السؤال","o":["أ","ب","ج","د"],"a":0}] حيث a رقم الإجابة الصح.';
 const P_C='اعمل 10 بطاقات مراجعة من المحتوى التالي. رجّع JSON فقط: [{"f":"السؤال أو المصطلح","b":"الإجابة"}]';
+const BASE='https://generativelanguage.googleapis.com';
+const getKey=()=>{const k=localStorage.k||'__GEMINI_KEY__';if(k.startsWith('__'))throw new Error('المفتاح مش متضاف');return k};
+const isBusyErr=m=>/high demand|overloaded|try again|unavailable|quota|rate|failed to fetch|network/i.test(m||'');
+/* ===== استدعاء Gemini مع إعادة محاولة تلقائية ===== */
 async function gem(parts,json){
- const key=localStorage.k||'__GEMINI_KEY__';if(key.startsWith('__'))throw new Error('المفتاح مش متضاف');
- const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+MODEL+':generateContent?key='+key,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:json?{responseMimeType:'application/json'}:{}})});
- const d=await r.json();if(d.error)throw new Error(d.error.message);
- return d.candidates[0].content.parts.map(p=>p.text||'').join('');
+ const key=getKey();let last;
+ for(let t=0;t<6;t++){
+  try{
+   const r=await fetch(BASE+'/v1beta/models/'+MODEL+':generateContent?key='+key,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts}],generationConfig:Object.assign({maxOutputTokens:32768},json?{responseMimeType:'application/json'}:{})})});
+   const d=await r.json();
+   if(d.error){
+    if((r.status==503||r.status==429||r.status==500||isBusyErr(d.error.message))&&t<5){last=new Error(d.error.message);await sleep((r.status==429?20000:4000)*(t+1));continue}
+    throw new Error(d.error.message);
+   }
+   return d.candidates[0].content.parts.map(p=>p.text||'').join('');
+  }catch(e){
+   if(t<5&&isBusyErr(e.message)){last=e;await sleep(4000*(t+1));continue}
+   throw e;
+  }
+ }
+ throw last||new Error('فشل الاتصال');
+}
+/* ===== رفع الملفات الكبيرة (محاضرة ساعتين) ===== */
+async function upFile(blob,mime){
+ const key=getKey();
+ const s=await fetch(BASE+'/upload/v1beta/files?key='+key,{method:'POST',headers:{'X-Goog-Upload-Protocol':'resumable','X-Goog-Upload-Command':'start','X-Goog-Upload-Header-Content-Length':String(blob.size),'X-Goog-Upload-Header-Content-Type':mime,'Content-Type':'application/json'},body:JSON.stringify({file:{display_name:'lecture'}})});
+ const url=s.headers.get('X-Goog-Upload-URL');if(!url)throw new Error('فشل بدء رفع الملف');
+ const u=await fetch(url,{method:'POST',headers:{'X-Goog-Upload-Offset':'0','X-Goog-Upload-Command':'upload, finalize'},body:blob});
+ let f=(await u.json()).file;if(!f)throw new Error('فشل رفع الملف');
+ for(let i=0;i<80&&f.state==='PROCESSING';i++){await sleep(5000);f=await(await fetch(BASE+'/v1beta/'+f.name+'?key='+key)).json()}
+ if(f.state!=='ACTIVE')throw new Error('الملف لسه بيتجهز، حاول تاني');
+ return f;
+}
+async function audioPart(blob,mime){
+ if(blob.size<14e6)return{inline_data:{mime_type:mime,data:await b64(blob)}};
+ const f=await upFile(blob,mime);return{file_data:{mime_type:mime,file_uri:f.uri}};
+}
+/* ===== عمل PDF بالعربي (رسم النص على canvas ثم تجميعه في PDF) ===== */
+function mdBlocks(s){const out=[];String(s||'').split('\n').forEach(l=>{l=l.trim();if(!l){out.push({k:'g'});return}const m=l.match(/^#+\s*(.*)$/);if(m){out.push({k:'h',s:m[1].replace(/\*\*/g,'')});return}out.push({k:'p',s:l.replace(/^[\*\-]\s+/,'• ').replace(/\*\*/g,'')})});return out}
+async function makePdf(blocks){
+ try{await document.fonts.ready}catch(e){}
+ const W=1240,H=1754,M=100;const pages=[];let cv,ctx,y;
+ const np=()=>{cv=document.createElement('canvas');cv.width=W;cv.height=H;ctx=cv.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);ctx.direction='rtl';ctx.textAlign='right';ctx.textBaseline='top';pages.push(cv);y=M};
+ np();
+ const put=(text,size,bold,color)=>{
+  const f=()=>{ctx.font=(bold?'bold ':'')+size+'px Amiri,Tajawal,sans-serif';ctx.fillStyle=color};
+  f();let line='';
+  const flush=l=>{if(y+size*1.9>H-M){np();f()}ctx.fillText(l,W-M,y);y+=size*1.9};
+  text.split(/\s+/).filter(Boolean).forEach(w=>{const tst=line?line+' '+w:w;if(line&&ctx.measureText(tst).width>W-2*M){flush(line);line=w}else line=tst});
+  if(line)flush(line);
+ };
+ blocks.forEach(b=>{
+  if(b.k=='g'){y+=22;return}
+  if(b.k=='t')put(b.s,56,true,'#4f46e5');
+  else if(b.k=='h')put(b.s,40,true,'#4f46e5');
+  else if(b.k=='b')put(b.s,32,true,'#1e1b4b');
+  else if(b.k=='a')put(b.s,28,true,'#059669');
+  else put(b.s,30,false,'#1e1b4b');
+ });
+ const enc=new TextEncoder();const parts=[];let off=0;const offs=[];
+ const add=x=>{const u=typeof x==='string'?enc.encode(x):x;parts.push(u);off+=u.length};
+ const obj=(id,fn)=>{offs[id]=off;add(id+' 0 obj\n');fn();add('\nendobj\n')};
+ const n=pages.length;
+ add('%PDF-1.4\n');
+ obj(1,()=>add('<< /Type /Catalog /Pages 2 0 R >>'));
+ obj(2,()=>add('<< /Type /Pages /Kids ['+pages.map((_,i)=>(3+3*i)+' 0 R').join(' ')+'] /Count '+n+' >>'));
+ pages.forEach((c,i)=>{
+  const jpg=Uint8Array.from(atob(c.toDataURL('image/jpeg',0.82).split(',')[1]),ch=>ch.charCodeAt(0));
+  const pid=3+3*i,cid=pid+1,iid=pid+2;
+  obj(pid,()=>add('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /XObject << /Im0 '+iid+' 0 R >> >> /Contents '+cid+' 0 R >>'));
+  const cs='q 595 0 0 842 0 0 cm /Im0 Do Q';
+  obj(cid,()=>add('<< /Length '+cs.length+' >>\nstream\n'+cs+'\nendstream'));
+  obj(iid,()=>{add('<< /Type /XObject /Subtype /Image /Width '+W+' /Height '+H+' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length '+jpg.length+' >>\nstream\n');add(jpg);add('\nendstream')});
+  c.width=1;c.height=1;
+ });
+ const xr=off,total=3+3*n;
+ add('xref\n0 '+total+'\n0000000000 65535 f \n');
+ for(let id=1;id<total;id++)add(String(offs[id]).padStart(10,'0')+' 00000 n \n');
+ add('trailer\n<< /Size '+total+' /Root 1 0 R >>\nstartxref\n'+xr+'\n%%EOF');
+ const out=new Uint8Array(off);let p=0;parts.forEach(u=>{out.set(u,p);p+=u.length});
+ return out;
+}
+/* حفظ الملف على الموبايل (مجلد Documents/Mulakhasati) */
+async function saveFile(bytes,name){
+ const fs=window.Capacitor&&Capacitor.Plugins&&Capacitor.Plugins.Filesystem;
+ if(fs){
+  try{try{await fs.requestPermissions()}catch(e){}
+   await fs.writeFile({path:'Mulakhasati/'+name,data:u8b64(bytes),directory:'DOCUMENTS',recursive:true});return 'fs'}catch(e){}
+ }
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([bytes],{type:'application/pdf'}));a.download=name;document.body.appendChild(a);a.click();a.remove();
+ return 'dl';
+}
+async function savePdfs(it){
+ const nm=s=>String(s).replace(/[\\/:*?"<>|]/g,' ').trim().slice(0,60);
+ const d=String(it.date||'').replace(/[\/\\]/g,'-');
+ const L=['أ','ب','ج','د'];
+ const b1=[{k:'t',s:it.title},{k:'p',s:it.date||''},{k:'g'},{k:'h',s:'الملخص'},...mdBlocks(it.summary)];
+ if(it.quiz&&it.quiz.length){
+  b1.push({k:'g'},{k:'h',s:'أسئلة وأجوبة على المحاضرة'});
+  it.quiz.forEach((q,n)=>{b1.push({k:'g'},{k:'b',s:(n+1)+'. '+q.q});q.o.forEach((o,k)=>b1.push({k:'p',s:L[k]+') '+o}));b1.push({k:'a',s:'الإجابة الصحيحة: '+L[q.a]+') '+q.o[q.a]})});
+ }
+ let r=await saveFile(await makePdf(b1),'ملخص - '+nm(it.title)+' '+d+'.pdf');
+ if(it.transcript){
+  const b2=[{k:'t',s:it.title},{k:'p',s:it.date||''},{k:'g'},{k:'h',s:'نص المحاضرة كاملاً'},...mdBlocks(it.transcript)];
+  r=await saveFile(await makePdf(b2),'المحاضرة كاملة - '+nm(it.title)+' '+d+'.pdf');
+ }
+ it.pdf=true;save();
+ return r=='fs'?'✅ اتحفظ ملفات PDF على موبايلك في مجلد Documents/Mulakhasati':'الملفات اتعملت وحاولت أنزلها. لو ماظهرتش في الموبايل لازم نضيف إضافة حفظ الملفات للتطبيق.';
 }
 function go(t){tab=t;cur=null;render()}
 function render(){
@@ -72,53 +185,112 @@ function render(){
  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('on',b.dataset.t==tab));
  $('#m').innerHTML=cur?detail():{lec:lecV,pdf:pdfV,sch:schV,set:setV}[tab]();
 }
-const itemCard=i=>`<div class="card" onclick="openI(${i.id})"><b>${i.type=='pdf'?'📄':'🎙️'} ${esc(i.title)}</b><small>${esc(i.date)}${i.dur?' • '+fmt(i.dur):''}</small></div>`;
+const itemCard=i=>`<div class="card ${i.status?'warn':''}" onclick="openI(${i.id})"><b>${i.type=='pdf'?'📄':'🎙️'} ${esc(i.title)}</b><small>${esc(i.date)}${i.dur?' • '+fmt(i.dur):''}${i.status?' • ⚠️ لسه ماتلخصتش (الصوت محفوظ) - اضغط للمحاولة':''}</small></div>`;
 const list=t=>db.items.filter(i=>i.type==t).map(itemCard).join('');
 function openI(id){cur=db.items.find(i=>i.id==id);sub='a';zs={};render()}
-function del(id){if(!confirm('تحذف العنصر ده؟'))return;db.items=db.items.filter(i=>i.id!=id);save();go(tab)}
+async function del(id){if(!confirm('تحذف العنصر ده من التطبيق؟ (ملفات PDF اللي اتحفظت على الموبايل هتفضل زي ما هي)'))return;db.items=db.items.filter(i=>i.id!=id);save();await adel('au'+id);go(tab)}
 function lecV(){
  const rec=mr&&mr.state!='inactive';
- return `<h2>المحاضرات</h2><div class="card c">${rec?`<div class="tm">${fmt(secs)}</div><div class="row"><button class="btn" onclick="pauseRec()">${paused?'▶️ استكمال':'⏸️ إيقاف مؤقت'}</button><button class="btn red" onclick="stopRec()">⏹️ إنهاء وتلخيص</button></div>`:`<button class="big" onclick="startRec()">🎙️ ابدأ تسجيل محاضرة</button>`}</div>`+(list('lec')||'<p class="mt">مفيش محاضرات لسه</p>');
+ const lost=!rec&&(+localStorage.rn>0);
+ return `<h2>المحاضرات</h2>`+(lost?`<div class="card warn c"><b>⚠️ فيه تسجيل اتقطع قبل ما يخلص</b><button class="big up" onclick="recoverRec()">♻️ استرجاع التسجيل</button></div>`:'')+`<div class="card c">${rec?`<div class="tm">${fmt(secs)}</div><div class="row"><button class="btn" onclick="pauseRec()">${paused?'▶️ استكمال':'⏸️ إيقاف مؤقت'}</button><button class="btn red" onclick="stopRec()">⏹️ إنهاء وتلخيص</button></div><small>التسجيل بيتحفظ لحظة بلحظة. سيب الشاشة شغالة.</small>`:`<button class="big" onclick="startRec()">🎙️ ابدأ تسجيل محاضرة</button>`}</div>`+(list('lec')||'<p class="mt">مفيش محاضرات لسه</p>');
 }
+async function clearRec(){const n=+localStorage.rn||0;localStorage.rn=0;for(let i=1;i<=n;i++)await adel('rc'+i)}
 async function startRec(){
  try{stream=await navigator.mediaDevices.getUserMedia({audio:true})}catch(e){alert('مش قادر أستخدم الميكروفون، اسمح بالإذن');return}
+ await clearRec();
  chunks=[];secs=0;paused=false;
- mr=new MediaRecorder(stream);mr.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
- mr.start(1000);
+ mr=new MediaRecorder(stream);
+ localStorage.rm=mr.mimeType||'audio/webm';
+ mr.ondataavailable=async e=>{if(e.data.size){chunks.push(e.data);const n=chunks.length;try{await aput('rc'+n,e.data);localStorage.rn=n}catch(_){}}};
+ mr.start(5000);
+ try{if(navigator.wakeLock)wl=await navigator.wakeLock.request('screen')}catch(e){}
  ti=setInterval(()=>{if(!paused){secs++;const t=$('.tm');if(t)t.textContent=fmt(secs)}},1000);
  render();
 }
 function pauseRec(){if(paused)mr.resume();else mr.pause();paused=!paused;render()}
+async function newLecture(blob,dur){
+ const id=Date.now();
+ await aput('au'+id,blob);
+ const it={id,type:'lec',title:'محاضرة جديدة',date:new Date().toLocaleDateString('ar-EG'),dur,status:'pending'};
+ db.items.unshift(it);save();return it;
+}
 async function stopRec(){
  clearInterval(ti);const d=secs;
  await new Promise(r=>{mr.onstop=r;mr.stop()});
  stream.getTracks().forEach(t=>t.stop());
+ try{if(wl)wl.release()}catch(e){};wl=null;
  const blob=new Blob(chunks,{type:mr.mimeType||'audio/webm'});
- busy('⏳ بلخّص المحاضرة...');
- try{
-  const a=await b64(blob);
-  const j=JSON.parse(await gem([{inline_data:{mime_type:(blob.type||'audio/webm').split(';')[0],data:a}},{text:P_LEC}],true));
-  const it={id:Date.now(),type:'lec',title:j.title||'محاضرة',date:new Date().toLocaleDateString('ar-EG'),dur:d,transcript:j.transcript,summary:j.summary};
-  db.items.unshift(it);save();cur=it;sub='a';zs={};
- }catch(e){alert('حصل خطأ: '+e.message)}
- busy();mr=null;render();
+ let it;
+ try{it=await newLecture(blob,d)}catch(e){alert('مش قادر أحفظ الصوت على الموبايل: '+e.message+'\nهنزّل نسخة من التسجيل دلوقتي.');dlBlob(blob,'lecture-'+Date.now());mr=null;render();return}
+ await sleep(500);await clearRec();
+ mr=null;chunks=[];
+ await proc(it);
 }
+async function recoverRec(){
+ const n=+localStorage.rn||0;const parts=[];
+ for(let i=1;i<=n;i++){const c=await aget('rc'+i);if(c)parts.push(c)}
+ if(!parts.length){await clearRec();render();return}
+ const blob=new Blob(parts,{type:(localStorage.rm||'audio/webm')});
+ const it=await newLecture(blob,0);
+ await clearRec();
+ await proc(it);
+}
+async function getAP(it){const blob=await aget('au'+it.id);if(!blob)throw new Error('الملف الصوتي مش موجود');return audioPart(blob,(blob.type||'audio/webm').split(';')[0])}
+async function getTranscript(it,ap){
+ const mins=Math.ceil((it.dur||0)/60);
+ if(mins<=30)return gem([ap,{text:P_T}],false);
+ const out=[];
+ for(let a=0;a<mins;a+=25){const b=Math.min(a+25,mins);busy('⏳ بكتب النص الكامل... ('+Math.min(100,Math.round(b/mins*100))+'%)');out.push(await gem([ap,{text:P_T+' اكتب بس الجزء من الدقيقة '+a+' لحد الدقيقة '+b+' من التسجيل.'}],false))}
+ return out.join('\n\n');
+}
+async function proc(it){
+ busy('⏳ بلخّص المحاضرة... لو طويلة ممكن ياخد كام دقيقة');
+ let ap;
+ try{
+  ap=await getAP(it);
+  const j=safeJ(await gem([ap,{text:P_S}],true));
+  it.title=j.title||'محاضرة';it.summary=j.summary||'';delete it.status;save();
+ }catch(e){alert('التسجيل محفوظ وماتخسرش. حصل خطأ: '+e.message+'\nافتح المحاضرة واضغط إعادة المحاولة.');busy();render();return}
+ cur=it;sub='a';zs={};tab='lec';
+ await extras(it,ap);
+ render();
+}
+/* النص الكامل + الأسئلة + حفظ PDF (بيكمّل أي حاجة ناقصة) */
+async function extras(it,ap){
+ const fails=[];let msg='';
+ if(!it.transcript){
+  try{busy('⏳ بكتب النص الكامل...');if(!ap)ap=await getAP(it);it.transcript=await getTranscript(it,ap);save()}catch(e){fails.push('النص الكامل')}
+ }
+ if(!it.quiz){
+  try{busy('⏳ بعمل أسئلة وأجوبة...');const q=JSON.parse(await gem([{text:P_Q+'\n\n'+(it.transcript||it.summary)}],true));if(!Array.isArray(q))throw new Error('x');it.quiz=q;save()}catch(e){fails.push('الأسئلة والأجوبة')}
+ }
+ try{busy('⏳ بحفظ ملفات PDF...');msg=await savePdfs(it)}catch(e){fails.push('ملفات PDF')}
+ busy();
+ alert((fails.length?'ماتعملش: '+fails.join('، ')+'\nافتح المحاضرة واضغط "كمّل الناقص".\n\n':'')+msg);
+}
+function dlBlob(b,name){const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name+'.webm';document.body.appendChild(a);a.click();a.remove()}
+async function dlAudio(id){const b=await aget('au'+id);if(!b)return alert('مفيش ملف صوتي');dlBlob(b,'lecture-'+id)}
+function retry(id){const it=db.items.find(i=>i.id==id);if(it){cur=null;proc(it)}}
+async function moreBtn(id){const it=db.items.find(i=>i.id==id);if(it){await extras(it);cur=it;render()}}
+async function pdfsBtn(id){const it=db.items.find(i=>i.id==id);if(!it)return;busy('⏳ بحفظ ملفات PDF...');try{const m=await savePdfs(it);busy();alert(m)}catch(e){busy();alert('حصل خطأ: '+e.message)}}
 function pdfV(){return `<h2>ملفات PDF</h2><div class="card c"><input type="file" accept="application/pdf" onchange="addPdf(this.files[0])"><small>اختار ملف PDF عشان يتلخص</small></div>`+(list('pdf')||'<p class="mt">مفيش ملفات لسه</p>')}
 async function addPdf(f){
  if(!f)return;busy('⏳ بقرا الملف وبلخصه...');
  try{
-  const j=JSON.parse(await gem([{inline_data:{mime_type:'application/pdf',data:await b64(f)}},{text:P_PDF}],true));
+  const j=safeJ(await gem([{inline_data:{mime_type:'application/pdf',data:await b64(f)}},{text:P_PDF}],true));
   const it={id:Date.now(),type:'pdf',title:j.title||f.name,date:new Date().toLocaleDateString('ar-EG'),summary:j.summary};
   db.items.unshift(it);save();cur=it;sub='a';zs={};
  }catch(e){alert('حصل خطأ: '+e.message)}
  busy();render();
 }
 function detail(){
- const i=cur,tabs=[['a','📝 الملخص'],['q','❓ اختبار'],['c','🃏 بطاقات']];if(i.transcript)tabs.push(['t','📃 النص']);
+ const i=cur;
+ if(i.status)return `<div class="top"><button class="ic" onclick="go(tab)">➡️</button><b>${esc(i.title)}</b><button class="ic" onclick="del(${i.id})">🗑️</button></div><div class="card warn c"><b>⚠️ المحاضرة لسه ماتلخصتش</b><small>الصوت محفوظ على موبايلك ومش هيضيع.</small><button class="big up" onclick="retry(${i.id})">🔁 إعادة المحاولة</button><button class="btn" onclick="dlAudio(${i.id})">💾 تنزيل التسجيل</button></div>`;
+ const tabs=[['a','📝 الملخص'],['q','❓ أسئلة وأجوبة'],['c','🃏 بطاقات']];if(i.transcript)tabs.push(['t','📃 النص الكامل']);
  let b;
- if(sub=='a')b=`<div class="read">${md(i.summary)}</div>`;
+ if(sub=='a')b=`<div class="read">${md(i.summary)}</div>`+(i.type=='lec'?`<div class="row"><button class="btn" onclick="pdfsBtn(${i.id})">📄 حفظ PDF</button><button class="btn" onclick="dlAudio(${i.id})">💾 تنزيل التسجيل</button>${(!i.transcript||!i.quiz)?`<button class="btn" onclick="moreBtn(${i.id})">🔄 كمّل الناقص</button>`:''}</div>`:'');
  else if(sub=='t')b=`<div class="read">${md(i.transcript)}</div>`;
- else if(sub=='q')b=i.quiz?i.quiz.map((q,n)=>`<div class="card"><b>${n+1}. ${esc(q.q)}</b>${q.o.map((o,k)=>`<button class="opt ${zs[n]==null?'':k==q.a?'ok':zs[n]==k?'no':''}" onclick="ans(${n},${k})">${esc(o)}</button>`).join('')}</div>`).join(''):`<button class="big" onclick="gen('quiz')">إنشاء اختبار</button>`;
+ else if(sub=='q')b=i.quiz?i.quiz.map((q,n)=>`<div class="card"><b>${n+1}. ${esc(q.q)}</b>${q.o.map((o,k)=>`<button class="opt ${zs[n]==null?'':k==q.a?'ok':zs[n]==k?'no':''}" onclick="ans(${n},${k})">${esc(o)}</button>`).join('')}</div>`).join(''):`<button class="big" onclick="gen('quiz')">إنشاء أسئلة وأجوبة</button>`;
  else b=i.cards?i.cards.map(c=>`<div class="card"><details><summary>${esc(c.f)}</summary><p>${esc(c.b)}</p></details></div>`).join(''):`<button class="big" onclick="gen('cards')">إنشاء بطاقات</button>`;
  return `<div class="top"><button class="ic" onclick="go(tab)">➡️</button><b>${esc(i.title)}</b><button class="ic" onclick="del(${i.id})">🗑️</button></div><div class="seg">${tabs.map(t=>`<button class="${sub==t[0]?'on':''}" onclick="sub='${t[0]}';render()">${t[1]}</button>`).join('')}</div>${b}`;
 }
@@ -150,7 +322,7 @@ async function addS(){
  if(!await notifOn(x))alert('اتضافت في الجدول، بس التنبيه مش شغال: اسمح بالإشعارات للتطبيق أو نزّل أحدث نسخة');
 }
 async function delS(id){const x=db.sched.find(s=>s.id==id);if(x)await notifOff(x);db.sched=db.sched.filter(s=>s.id!=id);save();render()}
-async function clearAll(){if(!confirm('تمسح كل البيانات؟'))return;for(const x of db.sched)await notifOff(x);db={items:[],sched:[]};save();render()}
+async function clearAll(){if(!confirm('تمسح كل البيانات؟ (المحاضرات والصوت)'))return;for(const x of db.sched)await notifOff(x);for(const i of db.items)await adel('au'+i.id);await clearRec();db={items:[],sched:[]};save();render()}
 function setV(){return `<h2>الإعدادات</h2><div class="card"><b>مفتاح Gemini</b><input id="gk" type="password" placeholder="الصق المفتاح هنا" value="${esc(localStorage.k||'')}"><button class="big up" onclick="localStorage.k=$('#gk').value.trim();alert('اتحفظ')">حفظ</button></div><div class="card"><button class="btn red" onclick="clearAll()">🗑️ مسح كل البيانات</button></div>`}
 render();
 </script></body></html>
